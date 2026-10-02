@@ -1,0 +1,64 @@
+name: bootstrap-ai-agent-infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'payload.part-*'
+      - 'payload.tail-*'
+      - 'payload.clean-*'
+      - '.github/workflows/bootstrap.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  expand:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct, verify and expand payload
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cat             payload.part-00             payload.part-01             payload.tail-00             payload.tail-01             payload.clean-00             payload.clean-01             payload.clean-02             payload.clean-03             payload.tail-04             payload.tail-05             payload.tail-06             payload.tail-07             | base64 -d > /tmp/aiinfra.tar.gz
+
+          echo "84f9b428aa80ad1553a228c1db0c4b6d1d8257bc32b5dec1113703c267681cfd  /tmp/aiinfra.tar.gz"             | sha256sum -c -
+
+          mkdir -p /tmp/aiinfra-expand
+          tar -xzf /tmp/aiinfra.tar.gz -C /tmp/aiinfra-expand
+
+          test -f /tmp/aiinfra-expand/ai_agent_infrastructure/install.sh
+          test -f /tmp/aiinfra-expand/ai_agent_infrastructure/README.md
+
+          cp -a /tmp/aiinfra-expand/ai_agent_infrastructure/. .
+
+          chmod +x             install.sh             verify.sh             lib/*.sh             bin/*             opencode/*.sh             tests/*.sh
+
+          ./tests/static.sh
+          ./tests/launcher_mock.sh
+
+      - name: Replace bootstrap payload with final repository
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          rm -f payload.part-* payload.tail-* payload.clean-*
+          rm -f .github/workflows/bootstrap.yml
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "Install portable AI agent infrastructure"
+          git push
