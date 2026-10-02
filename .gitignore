@@ -1,0 +1,10 @@
+# installer/runtime state
+.ai-agent-infrastructure/
+.openviking/
+server.log
+*.log
+*.pid
+*.bak.*
+.env
+.env.*
+!.env.example

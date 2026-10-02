@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SUP="${AI_SUPERVISOR_HOME:-$HOME/.local/share/ai-supervisor}"
+PROFILE="${AI_SUPERVISOR_PROFILE:-supervisor}"
+OPENCODE_MODE="${AI_OPENCODE_MODE:-ogptlw}"
+EXECUTOR="${AI_OPENCODE_EXECUTOR:-$HOME/.local/bin/ai-opencode-exec}"
+
+usage(){ echo "Usage: ai-supervisor-run [--opencode-mode MODE] <repo> <objective.md> [max-attempts] | --resume <workflow-dir>" >&2; exit 64; }
+validate_mode(){ case "$1" in nogpt|gpt|gptlw|ogptlw|nv|dsfv4|dslw|odslw|ofree|onv|lw) return 0;; *) echo "INVALID_OPENCODE_MODE=$1" >&2; return 64;; esac; }
+state_get(){ python3 - "$1" "$2" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1])); v=x[sys.argv[2]]
+print("" if v is None else v)
+PY
+}
+state_patch(){
+  local state="$1"; shift
+  python3 - "$state" "$@" <<'PY'
+import json,sys
+from datetime import datetime,timezone
+p=sys.argv[1]; d=json.load(open(p))
+for item in sys.argv[2:]:
+ k,v=item.split('=',1)
+ if k in {'next_attempt','max_attempts'}: v=int(v)
+ elif v=='None': v=None
+ d[k]=v
+d['updated_utc']=datetime.now(timezone.utc).isoformat()
+open(p,'w').write(json.dumps(d,indent=2)+'\n')
+PY
+}
+validate_verdict(){
+  python3 - "$1" "$2" "$3" <<'PY'
+import json,sys
+p,w,a=sys.argv[1:]; d=json.load(open(p))
+required=['workflow_id','attempt','verdict','reason','acceptance_checks']
+missing=[k for k in required if k not in d]
+if missing: raise SystemExit('VERDICT_MISSING_FIELDS='+','.join(missing))
+if d['workflow_id']!=w: raise SystemExit('VERDICT_WORKFLOW_MISMATCH')
+if int(d['attempt'])!=int(a): raise SystemExit('VERDICT_ATTEMPT_MISMATCH')
+if d['verdict'] not in {'GO','RETRY','BLOCKED'}: raise SystemExit('VERDICT_INVALID')
+print(d['verdict'])
+PY
+}
+write_max_attempts_verdict(){
+  python3 - "$1" "$2" "$3" <<'PY'
+import json,sys
+from datetime import datetime,timezone
+out,w,m=sys.argv[1:]
+d={'workflow_id':w,'attempt':int(m),'verdict':'BLOCKED','reason':'MAX_ATTEMPTS_EXHAUSTED','task_file':None,'executor_run_dir':None,'executor_result':None,'acceptance_checks':[],'created_utc':datetime.now(timezone.utc).isoformat()}
+open(out,'w').write(json.dumps(d,indent=2)+'\n')
+PY
+}
+
+if [[ "${1:-}" == --opencode-mode ]]; then [[ $# -ge 2 ]] || usage; OPENCODE_MODE="$2"; validate_mode "$OPENCODE_MODE" || exit $?; shift 2; fi
+MODE=start
+if [[ "${1:-}" == --resume ]]; then
+  MODE=resume; WF="$(cd "${2:-/nonexistent}" 2>/dev/null && pwd -P || true)"; [[ -n "$WF" && -f "$WF/state.json" ]] || { echo "WORKFLOW_STATE_NOT_FOUND=${WF:-}" >&2; exit 66; }
+  STATE="$WF/state.json"; REPO="$(state_get "$STATE" repo)"; WORKFLOW_ID="$(state_get "$STATE" workflow_id)"; REPO_KEY="$(state_get "$STATE" repo_key)"; MAX_ATTEMPTS="$(state_get "$STATE" max_attempts)"; SESSION_TITLE="$(state_get "$STATE" session_title)"; ATTEMPT="$(state_get "$STATE" next_attempt)"; OBJECTIVE="$WF/objective.md"; OPENCODE_MODE="$(state_get "$STATE" opencode_mode 2>/dev/null || echo ogptlw)"; validate_mode "$OPENCODE_MODE" || exit $?
+else
+  REPO_INPUT="${1:-}"; OBJECTIVE_INPUT="${2:-}"; MAX_ATTEMPTS="${3:-4}"; [[ -d "$REPO_INPUT" && -f "$OBJECTIVE_INPUT" ]] || usage
+  validate_mode "$OPENCODE_MODE" || exit $?; [[ "$MAX_ATTEMPTS" =~ ^[0-9]+$ && "$MAX_ATTEMPTS" -ge 1 ]] || { echo INVALID_MAX_ATTEMPTS >&2; exit 64; }
+  REPO="$(git -C "$REPO_INPUT" rev-parse --show-toplevel 2>/dev/null || cd "$REPO_INPUT" && pwd -P)"; REPO="$(cd "$REPO" && pwd -P)"; OBJECTIVE_INPUT="$(cd "$(dirname "$OBJECTIVE_INPUT")" && pwd -P)/$(basename "$OBJECTIVE_INPUT")"
+  REPO_HASH="$(printf '%s' "$REPO" | sha256sum | cut -c1-12)"; REPO_KEY="$(basename "$REPO")-$REPO_HASH"; OBJECTIVE_HASH="$(sha256sum "$OBJECTIVE_INPUT" | awk '{print substr($1,1,10)}')"; WORKFLOW_ID="W$(date -u +%Y%m%dT%H%M%SZ)-$OBJECTIVE_HASH-$$"; WF="$SUP/workflows/$REPO_KEY/$WORKFLOW_ID"; mkdir -p "$WF/attempts" "$WF/tasks"; cp "$OBJECTIVE_INPUT" "$WF/objective.md"; sha256sum "$WF/objective.md" > "$WF/objective.sha256"; SESSION_TITLE="ai-supervisor-$WORKFLOW_ID"; STATE="$WF/state.json"; ATTEMPT=1
+  export WORKFLOW_ID REPO_KEY REPO WF MAX_ATTEMPTS SESSION_TITLE OPENCODE_MODE
+  python3 - <<'PY'
+import json,os
+from datetime import datetime,timezone
+from pathlib import Path
+wf=Path(os.environ['WF']); now=datetime.now(timezone.utc).isoformat()
+d={'workflow_id':os.environ['WORKFLOW_ID'],'repo_key':os.environ['REPO_KEY'],'repo':os.environ['REPO'],'objective':str(wf/'objective.md'),'status':'RUNNING','next_attempt':1,'max_attempts':int(os.environ['MAX_ATTEMPTS']),'opencode_mode':os.environ['OPENCODE_MODE'],'session_title':os.environ['SESSION_TITLE'],'created_utc':now,'updated_utc':now,'final_verdict':None}
+(wf/'state.json').write_text(json.dumps(d,indent=2)+'\n')
+PY
+  mkdir -p "$SUP/workflows/$REPO_KEY"; ln -sfn "$WF" "$SUP/workflows/$REPO_KEY/latest"; ln -sfn "$WF" "$SUP/latest-workflow"; printf '%s\n' "$WF" > "$SUP/workflows/$REPO_KEY/latest.path"
+fi
+
+[[ -x "$EXECUTOR" ]] || { echo "EXECUTOR_NOT_EXECUTABLE=$EXECUTOR" >&2; exit 69; }
+echo "AI_SUPERVISOR_WORKFLOW=$WF"; echo "AI_SUPERVISOR_SESSION=$SESSION_TITLE"; echo "AI_SUPERVISOR_MAX_ATTEMPTS=$MAX_ATTEMPTS"; echo "AI_SUPERVISOR_OPENCODE_MODE=$OPENCODE_MODE"
+
+while true; do
+  case "$(state_get "$STATE" status)" in GO) echo AI_SUPERVISOR_RESULT=GO; exit 0;; BLOCKED) echo AI_SUPERVISOR_RESULT=BLOCKED; exit 2;; esac
+  ATTEMPT="$(state_get "$STATE" next_attempt)"
+  if (( ATTEMPT > MAX_ATTEMPTS )); then FINAL="$WF/supervisor-verdict.json"; write_max_attempts_verdict "$FINAL" "$WORKFLOW_ID" "$MAX_ATTEMPTS"; state_patch "$STATE" status=BLOCKED final_verdict="$FINAL"; echo AI_SUPERVISOR_RESULT=BLOCKED; echo AI_SUPERVISOR_REASON=MAX_ATTEMPTS_EXHAUSTED; exit 2; fi
+  PAD="$(printf '%03d' "$ATTEMPT")"; AD="$WF/attempts/$PAD"; TASK="$WF/tasks/attempt-$PAD.md"; VERDICT="$AD/supervisor-verdict.json"; PROMPT="$AD/hermes-prompt.md"; mkdir -p "$AD"
+  PREVIOUS=NONE; if ((ATTEMPT>1)); then PREV="$(printf '%03d' "$((ATTEMPT-1))")"; PREVIOUS="$WF/attempts/$PREV/supervisor-verdict.json"; fi
+
+  # OpenViking must be available before every supervisor turn.
+  if [[ -x "$REPO/.ai-agent-infrastructure/bin/ensure-openviking" ]]; then "$REPO/.ai-agent-infrastructure/bin/ensure-openviking" || { state_patch "$STATE" status=INTERRUPTED next_attempt="$ATTEMPT"; echo OPENVIKING_START_FAILED >&2; exit 4; }; fi
+
+  cat > "$PROMPT" <<EOF2
+# AI Supervisor Workflow
+
+INTERNAL_SUPERVISOR_INVOCATION=1
+This is already an internal ai-supervisor-run execution. Do NOT invoke ai-supervisor-submit or ai-supervisor-run from this supervisor turn.
+
+Workflow ID: $WORKFLOW_ID
+Attempt: $ATTEMPT of $MAX_ATTEMPTS
+Repository: $REPO
+OpenCode execution mode: $OPENCODE_MODE
+Acceptance objective: $WF/objective.md
+Previous supervisor verdict: $PREVIOUS
+Worker task to create: $TASK
+Required supervisor verdict: $VERDICT
+Workflow-scoped executor evidence: $WF/executor-latest
+
+## Your job
+Act as independent supervisor. Read acceptance objective completely. On retry read previous verdict/evidence. Create a precise worker task at $TASK, then execute exactly:
+
+AI_WORKFLOW_DIR='$WF' AI_OPENCODE_MODE='$OPENCODE_MODE' AI_OPENCODE_LAUNCHER_DIR='$REPO' '$EXECUTOR' '$REPO' '$TASK'
+
+Independently inspect repository and executor evidence afterward. Do not infer success from exit code alone.
+GO only if every criterion passes. RETRY if another worker attempt can reasonably fix it. BLOCKED only for concrete external/unrecoverable blocker.
+
+Write valid JSON to $VERDICT with keys: workflow_id, attempt, verdict, reason, task_file, executor_run_dir, executor_result, acceptance_checks, created_utc. Each acceptance_checks entry: criterion, status PASS|FAIL|UNKNOWN, evidence. Validate JSON before ending. Text response may summarize; JSON is authoritative.
+EOF2
+
+  echo; echo "===== SUPERVISOR ATTEMPT $ATTEMPT/$MAX_ATTEMPTS ====="
+  set +e
+  AI_SUPERVISOR_INTERNAL=1 AI_OPENCODE_MODE="$OPENCODE_MODE" hermes -p "$PROFILE" --yolo chat --in "$WF" -c "$SESSION_TITLE" --create-if-missing -Q --query-file "$PROMPT" > "$AD/hermes.stdout" 2> "$AD/hermes.stderr"
+  HRC=$?
+  set -e
+  printf '%s\n' "$HRC" > "$AD/hermes-exit-code.txt"
+  if ((HRC!=0)); then state_patch "$STATE" status=INTERRUPTED next_attempt="$ATTEMPT"; echo "HERMES_EXECUTION_FAILED=$HRC" >&2; echo "RESUME_WITH=ai-supervisor-run --resume '$WF'" >&2; exit 4; fi
+  [[ -f "$VERDICT" ]] || { state_patch "$STATE" status=INTERRUPTED next_attempt="$ATTEMPT"; echo "SUPERVISOR_VERDICT_MISSING=$VERDICT" >&2; exit 4; }
+  if ! VALUE="$(validate_verdict "$VERDICT" "$WORKFLOW_ID" "$ATTEMPT")"; then state_patch "$STATE" status=INTERRUPTED next_attempt="$ATTEMPT"; echo "SUPERVISOR_VERDICT_INVALID=$VERDICT" >&2; exit 4; fi
+  echo "SUPERVISOR_VERDICT=$VALUE"
+  case "$VALUE" in
+    GO) cp "$VERDICT" "$WF/supervisor-verdict.json"; state_patch "$STATE" status=GO final_verdict="$WF/supervisor-verdict.json" next_attempt="$ATTEMPT"; echo AI_SUPERVISOR_RESULT=GO; echo "AI_SUPERVISOR_WORKFLOW=$WF"; exit 0;;
+    BLOCKED) cp "$VERDICT" "$WF/supervisor-verdict.json"; state_patch "$STATE" status=BLOCKED final_verdict="$WF/supervisor-verdict.json" next_attempt="$ATTEMPT"; echo AI_SUPERVISOR_RESULT=BLOCKED; exit 2;;
+    RETRY) NEXT=$((ATTEMPT+1)); state_patch "$STATE" status=RUNNING next_attempt="$NEXT"; echo "AI_SUPERVISOR_RETRY=$NEXT";;
+  esac
+done

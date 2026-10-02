@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+start="$PWD"; d="$start"; project=""
+while :; do
+  if [[ -f "$d/.ai-agent-infrastructure/installed.json" ]]; then project="$d"; break; fi
+  [[ "$d" == / ]] && break
+  nd="$(dirname "$d")"; [[ "$nd" == "$d" ]] && break; d="$nd"
+done
+real_file="$HOME/.config/ai-agent-infrastructure/hermes-real"
+[[ -f "$real_file" ]] || { echo "Hermes router not configured: $real_file missing" >&2; exit 69; }
+REAL="$(cat "$real_file")"
+[[ -x "$REAL" ]] || { echo "Real Hermes binary not executable: $REAL" >&2; exit 69; }
+if [[ -n "$project" ]]; then
+  ensure="$project/.ai-agent-infrastructure/bin/ensure-openviking"
+  if [[ -x "$ensure" ]]; then
+    if ! "$ensure"; then echo "OpenViking unavailable. Hermes session aborted before operation." >&2; exit 70; fi
+  else
+    echo "OpenViking ensure hook missing; attempting project repair is recommended." >&2
+  fi
+fi
+exec "$REAL" "$@"

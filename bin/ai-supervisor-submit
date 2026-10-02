@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+SUP="${AI_SUPERVISOR_HOME:-$HOME/.local/share/ai-supervisor}"
+MAX_ATTEMPTS="${AI_SUPERVISOR_MAX_ATTEMPTS:-6}"
+OPENCODE_MODE="${AI_OPENCODE_MODE:-ogptlw}"
+REPO_INPUT=""
+usage(){ echo "Usage: ai-supervisor-submit [--repo PATH] [--opencode-mode MODE] [--max-attempts N] [objective text...]" >&2; exit 64; }
+while (($#)); do
+  case "$1" in
+    --repo) [[ $# -ge 2 ]] || usage; REPO_INPUT="$2"; shift 2;;
+    --opencode-mode) [[ $# -ge 2 ]] || usage; OPENCODE_MODE="$2"; shift 2;;
+    --max-attempts) [[ $# -ge 2 ]] || usage; MAX_ATTEMPTS="$2"; shift 2;;
+    --help|-h) usage;;
+    --) shift; break;;
+    *) break;;
+  esac
+done
+case "$OPENCODE_MODE" in nogpt|gpt|gptlw|ogptlw|nv|dsfv4|dslw|odslw|ofree|onv|lw) ;; *) echo "INVALID_OPENCODE_MODE=$OPENCODE_MODE" >&2; exit 64;; esac
+[[ "$MAX_ATTEMPTS" =~ ^[0-9]+$ && "$MAX_ATTEMPTS" -ge 1 ]] || { echo "INVALID_MAX_ATTEMPTS=$MAX_ATTEMPTS" >&2; exit 64; }
+if [[ -n "$REPO_INPUT" ]]; then ROOT="$(git -C "$REPO_INPUT" rev-parse --show-toplevel 2>/dev/null || cd "$REPO_INPUT" && pwd -P)"; else ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"; fi
+if (($#)); then REQUEST="$*"; else REQUEST="$(cat)"; fi
+[[ -n "${REQUEST//[[:space:]]/}" ]] || { echo EMPTY_OBJECTIVE >&2; exit 64; }
+REPO_HASH="$(printf '%s' "$ROOT" | sha256sum | cut -c1-12)"; REPO_KEY="$(basename "$ROOT")-$REPO_HASH"; STAMP="$(date -u +%Y%m%dT%H%M%SZ)"; DIR="$SUP/objectives/auto/$REPO_KEY"; OBJ="$DIR/$STAMP-$$.md"; mkdir -p "$DIR"
+cat > "$OBJ" <<EOF2
+# Automatically routed Hermes implementation objective
+
+Repository:
+$ROOT
+
+Created:
+$STAMP
+
+Source:
+Interactive Hermes automatic project router
+
+OpenCode mode:
+$OPENCODE_MODE
+
+## User request
+
+$REQUEST
+
+## Mandatory execution policy
+
+The complete user request above is authoritative.
+Acceptance requires satisfying every explicit user requirement.
+Implementation must use:
+Hermes supervisor
+→ ai-supervisor-run
+→ ai-opencode-exec
+→ bash ./oc.sh $OPENCODE_MODE run
+→ OpenCode + OMO
+→ evidence
+→ GO / RETRY / BLOCKED
+
+Rules:
+- Preserve unrelated user changes.
+- Diagnose root causes rather than masking failures.
+- Verify implementation directly.
+- Commit only if explicitly requested/authorized.
+- Push only if explicitly requested/authorized.
+- Never force-push.
+- Never use git reset --hard or git clean to discard user work.
+- OpenCode must never be launched directly; oc.sh is mandatory.
+EOF2
+echo "AI_AUTO_OBJECTIVE=$OBJ"; echo "AI_AUTO_REPO=$ROOT"; echo "AI_AUTO_MAX_ATTEMPTS=$MAX_ATTEMPTS"
+exec "$HOME/.local/bin/ai-supervisor-run" --opencode-mode "$OPENCODE_MODE" "$ROOT" "$OBJ" "$MAX_ATTEMPTS"
